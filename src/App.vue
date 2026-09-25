@@ -2,6 +2,15 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { parseFormula, type ParseResult } from './lib/parser'
 import { balance, type BalanceResult, type Species } from './lib/solver'
+import {
+  computeStoich,
+  formatFraction,
+  UNIT_LABELS,
+  type AmountUnit,
+  type StoichInput,
+  type StoichResult,
+  type StoichSpecies,
+} from './lib/stoich'
 
 interface Row {
   id: number
@@ -38,7 +47,7 @@ const EXAMPLES: Array<{ name: string; left: string[]; right: string[] }> = [
 ]
 
 interface Snapshot {
-  rows: { side: 'left' | 'right'; text: string }[]
+  rows: { side: 'left' | 'right'; text: string; id: number }[]
   result: BalanceResult
   elementOrder: string[]
 }
@@ -128,12 +137,12 @@ function doBalance() {
   for (const p of leftParsed.value) {
     if (p.row.text.trim() === '' || !p.result.ok) continue
     species.push({ raw: p.row.text.trim(), formula: p.result.formula!, side: 'left' })
-    rowsSnapshot.push({ side: 'left', text: p.row.text })
+    rowsSnapshot.push({ side: 'left', text: p.row.text, id: p.row.id })
   }
   for (const p of rightParsed.value) {
     if (p.row.text.trim() === '' || !p.result.ok) continue
     species.push({ raw: p.row.text.trim(), formula: p.result.formula!, side: 'right' })
-    rowsSnapshot.push({ side: 'right', text: p.row.text })
+    rowsSnapshot.push({ side: 'right', text: p.row.text, id: p.row.id })
   }
   const result = balance(species)
   const elementOrder: string[] = []
@@ -235,6 +244,151 @@ function formatCharge(n: bigint): string {
   const sign = n > 0n ? '+' : '-'
   const mag = n < 0n ? -n : n
   return mag === 1n ? sign : `${mag}${sign}`
+}
+
+/* ---------- 投料方案与限量试剂 ---------- */
+
+interface PlanInput {
+  amount: string
+  unit: AmountUnit
+}
+
+interface Plan {
+  id: number
+  name: string
+  /** 按物质行 id 存放，物质调序时投料随之移动 */
+  inputs: Record<number, PlanInput>
+  molarMasses: Record<number, string>
+  result: StoichResult | null
+  /** 投料被编辑后结果失效 */
+  stale: boolean
+}
+
+let nextPlanId = 1
+const plans = reactive<Plan[]>([])
+const activePlanId = ref<number | null>(null)
+
+const activePlan = computed(() => plans.find((p) => p.id === activePlanId.value) ?? null)
+
+const fmt = formatFraction
+const unitLabels = UNIT_LABELS
+
+const hasElectron = computed(() => {
+  const snap = snapshot.value
+  if (!snap) return false
+  return snap.rows.some((r) => {
+    const parsed = parseFormula(r.text)
+    return parsed.ok && parsed.formula.isElectron
+  })
+})
+
+const stoichSpecies = computed<StoichSpecies[]>(() => {
+  const snap = snapshot.value
+  if (!snap || snap.result.kind !== 'unique') return []
+  const coef = snap.result.coefficients
+  return snap.rows.map((r, i) => ({ id: r.id, side: r.side, label: r.text, coefficient: coef[i] }))
+})
+
+function createPlan(name?: string): Plan {
+  const plan: Plan = {
+    id: nextPlanId,
+    name: name ?? '方案 ' + nextPlanId,
+    inputs: {},
+    molarMasses: {},
+    result: null,
+    stale: false,
+  }
+  nextPlanId++
+  plans.push(plan)
+  activePlanId.value = plan.id
+  return plan
+}
+
+function planInput(plan: Plan, rowId: number): PlanInput {
+  if (!plan.inputs[rowId]) plan.inputs[rowId] = { amount: '', unit: 'mol' }
+  return plan.inputs[rowId]
+}
+
+function markPlanStale(plan: Plan) {
+  plan.stale = true
+}
+
+function duplicatePlan(plan: Plan) {
+  const copy = createPlan(plan.name + '（副本）')
+  copy.inputs = JSON.parse(JSON.stringify(plan.inputs))
+  copy.molarMasses = { ...plan.molarMasses }
+  copy.result = null
+  copy.stale = false
+}
+
+function deletePlan(plan: Plan) {
+  const idx = plans.findIndex((p) => p.id === plan.id)
+  if (idx >= 0) plans.splice(idx, 1)
+  if (activePlanId.value === plan.id) activePlanId.value = plans[0]?.id ?? null
+}
+
+function computeActivePlan() {
+  const plan = activePlan.value
+  const snap = snapshot.value
+  if (!plan || !snap || snap.result.kind !== 'unique' || stale.value || hasElectron.value) return
+  const inputs = new Map<number, StoichInput>()
+  for (const sp of stoichSpecies.value) {
+    const pi = plan.inputs[sp.id] ?? { amount: '', unit: 'mol' as AmountUnit }
+    inputs.set(sp.id, { amount: pi.amount, unit: pi.unit, molarMass: plan.molarMasses[sp.id] ?? '' })
+  }
+  plan.result = computeStoich(stoichSpecies.value, inputs)
+  plan.stale = false
+}
+
+function planResultValid(plan: Plan): boolean {
+  return plan.result !== null && !plan.stale && !stale.value
+}
+
+const comparablePlans = computed(() =>
+  plans.filter((p) => planResultValid(p) && p.result !== null && !p.result.hasError),
+)
+
+const productLabels = computed(() =>
+  stoichSpecies.value.filter((sp) => sp.side === 'right').map((sp) => sp.label),
+)
+
+function errorsFor(plan: Plan, rowId: number, field: 'amount' | 'molarMass'): string[] {
+  if (!plan.result || plan.stale) return []
+  const entry = plan.result.entries.find((e) => e.species.id === rowId)
+  return entry ? entry.errors.filter((e) => e.field === field).map((e) => e.message) : []
+}
+
+function hasFieldError(plan: Plan, rowId: number, field: 'amount' | 'molarMass'): boolean {
+  return errorsFor(plan, rowId, field).length > 0
+}
+
+function limitingText(result: StoichResult): string {
+  return result.limiting.map((i) => result.entries[i].species.label).join('、')
+}
+
+function productYieldText(plan: Plan, label: string): string {
+  const entry = plan.result?.entries.find((e) => e.species.side === 'right' && e.species.label === label)
+  if (!entry || !entry.produced) return '—'
+  let text = fmt(entry.produced).text + ' mol'
+  if (entry.mass) text += '（' + fmt(entry.mass).text + ' g）'
+  return text
+}
+
+function fillStoichExample(kind: 'exact' | 'excess') {
+  const plan = createPlan(kind === 'exact' ? '示例：恰好配比' : '示例：试剂过量')
+  let firstLeftSeen = false
+  for (const sp of stoichSpecies.value) {
+    if (sp.side !== 'left') continue
+    let amount = sp.coefficient
+    if (kind === 'excess' && !firstLeftSeen) amount = sp.coefficient * 2n
+    firstLeftSeen = true
+    plan.inputs[sp.id] = { amount: amount.toString(), unit: 'mol' }
+  }
+  plan.stale = true
+  globalMessage.value =
+    kind === 'exact'
+      ? '已生成「恰好配比」示例方案：各反应物投料 = 系数 mol，点击「计算投料结果」查看。'
+      : '已生成「试剂过量」示例方案：第一种反应物加倍、其余按系数投料，点击「计算投料结果」查看。'
 }
 
 function coefFor(side: 'left' | 'right', indexWithinSide: number): bigint | null {
@@ -474,9 +628,230 @@ onUnmounted(() => window.removeEventListener('keydown', onGlobalKey))
         <strong>不能配平为全正系数：</strong>{{ snapshot.result.reason }}
         <p>唯一解（取绝对值，仅作核对）：{{ snapshot.result.sample.join('、') }}</p>
       </div>
-      <div v-else-if="snapshot.result.kind === 'infinite'" class="banner bad" role="alert">
+    <div v-else-if="snapshot.result.kind === 'infinite'" class="banner bad" role="alert">
         <strong>解不唯一：</strong>{{ snapshot.result.reason }}
       </div>
+    </section>
+
+    <section v-if="snapshot && snapshot.result.kind === 'unique'" class="stoich-section" aria-label="投料方案">
+      <h2>限量试剂与投料方案</h2>
+      <div v-if="hasElectron" class="banner info" role="status">
+        当前反应含有电子 e^-（半反应），投料与限量试剂计算不适用。
+      </div>
+      <template v-else>
+        <div v-if="stale" class="banner warn" role="status">
+          物质已增删或化学式已修改，所有投料方案的结果已失效。请重新点击「配平」，核对各方案输入后重新计算。
+        </div>
+
+        <div class="plan-bar">
+          <button
+            v-for="p in plans"
+            :key="p.id"
+            type="button"
+            class="plan-tab"
+            :class="{ active: p.id === activePlanId }"
+            @click="activePlanId = p.id"
+          >
+            {{ p.name }}<template v-if="p.result && !planResultValid(p)">（已失效）</template>
+          </button>
+          <button type="button" class="example-btn" @click="createPlan()">+ 新建方案</button>
+          <button type="button" class="example-btn" :disabled="stale" @click="fillStoichExample('exact')">
+            示例：恰好配比
+          </button>
+          <button type="button" class="example-btn" :disabled="stale" @click="fillStoichExample('excess')">
+            示例：试剂过量
+          </button>
+        </div>
+
+        <div v-if="activePlan" class="plan-body">
+          <div class="plan-tools">
+            <label>
+              方案名：
+              <input v-model="activePlan.name" class="plan-name-input" aria-label="方案名称" />
+            </label>
+            <button type="button" @click="duplicatePlan(activePlan)">复制方案</button>
+            <button type="button" @click="deletePlan(activePlan)">删除方案</button>
+          </div>
+
+          <table class="stoich-table">
+            <thead>
+              <tr>
+                <th>物质</th>
+                <th>系数</th>
+                <th>投料数量</th>
+                <th>单位</th>
+                <th>摩尔质量 (g/mol，选填)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="sp in stoichSpecies" :key="sp.id">
+                <td>
+                  <span class="side-tag">{{ sp.side === 'left' ? '反应物' : '生成物' }}</span>
+                  {{ sp.label }}
+                </td>
+                <td>{{ sp.coefficient }}</td>
+                <template v-if="sp.side === 'left'">
+                  <td>
+                    <input
+                      v-model="planInput(activePlan, sp.id).amount"
+                      class="amount-input"
+                      :class="{ invalid: hasFieldError(activePlan, sp.id, 'amount') }"
+                      :aria-label="sp.label + ' 投料数量'"
+                      :aria-invalid="hasFieldError(activePlan, sp.id, 'amount')"
+                      placeholder="如 1.5"
+                      @input="markPlanStale(activePlan)"
+                      @keydown.enter="computeActivePlan"
+                    />
+                    <p
+                      v-for="err in errorsFor(activePlan, sp.id, 'amount')"
+                      :key="err"
+                      class="error"
+                      role="alert"
+                    >
+                      {{ err }}
+                    </p>
+                  </td>
+                  <td>
+                    <select
+                      v-model="planInput(activePlan, sp.id).unit"
+                      :aria-label="sp.label + ' 单位'"
+                      @change="markPlanStale(activePlan)"
+                    >
+                      <option v-for="(label, u) in unitLabels" :key="u" :value="u">{{ label }}</option>
+                    </select>
+                  </td>
+                </template>
+                <template v-else>
+                  <td colspan="2" class="hint">生成物无需投料</td>
+                </template>
+                <td>
+                  <input
+                    v-model="activePlan.molarMasses[sp.id]"
+                    class="amount-input"
+                    :class="{ invalid: hasFieldError(activePlan, sp.id, 'molarMass') }"
+                    :aria-label="sp.label + ' 摩尔质量'"
+                    :aria-invalid="hasFieldError(activePlan, sp.id, 'molarMass')"
+                    placeholder="选填"
+                    @input="markPlanStale(activePlan)"
+                    @keydown.enter="computeActivePlan"
+                  />
+                  <p
+                    v-for="err in errorsFor(activePlan, sp.id, 'molarMass')"
+                    :key="err"
+                    class="error"
+                    role="alert"
+                  >
+                    {{ err }}
+                  </p>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="actions">
+            <button type="button" class="balance-btn" :disabled="stale" @click="computeActivePlan">
+              计算投料结果
+            </button>
+            <span class="hint">数量支持普通十进制数；空值、负数与非法文本会定位提示，不会被当作 0。</span>
+          </div>
+
+          <p v-if="activePlan.result && activePlan.stale" class="banner warn" role="status">
+            投料已修改，该方案结果已失效，请重新计算。
+          </p>
+
+          <div v-if="activePlan.result && planResultValid(activePlan)" class="plan-result">
+            <div v-if="activePlan.result.hasError" class="banner bad" role="alert">
+              输入存在错误，请根据各字段下方提示修正后重新计算。
+            </div>
+            <template v-else>
+              <p class="limiting-line">
+                <strong>限量试剂：</strong>{{ limitingText(activePlan.result) }}
+                （反应进度 ξ = {{ fmt(activePlan.result.extent!).text }} mol）
+              </p>
+              <p class="hint">
+                假设：反应完全进行且无副反应，理论产量 = ξ × 系数。内部以精确有理数比较与运算，仅显示时保留
+                6 位有效数字，「≈」表示经舍入；并列限量与零剩余均由精确值判定。
+              </p>
+
+              <h3>换算与比例依据（反应物）</h3>
+              <table class="stoich-table">
+                <thead>
+                  <tr>
+                    <th>物质</th>
+                    <th>投料 (mol)</th>
+                    <th>系数</th>
+                    <th>n / 系数 (mol)</th>
+                    <th>消耗 (mol)</th>
+                    <th>剩余 (mol)</th>
+                    <th>剩余质量 (g)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="entry in activePlan.result.entries.filter((e) => e.species.side === 'left')"
+                    :key="entry.species.id"
+                    :class="{ limiting: activePlan.result!.limiting.includes(activePlan.result!.entries.indexOf(entry)) }"
+                  >
+                    <td>{{ entry.species.label }}</td>
+                    <td>{{ fmt(entry.mol!).text }}</td>
+                    <td>{{ entry.species.coefficient }}</td>
+                    <td>{{ fmt(entry.ratio!).text }}</td>
+                    <td>{{ fmt(entry.consumed!).text }}</td>
+                    <td>{{ fmt(entry.remaining!).text }}</td>
+                    <td>{{ entry.mass ? fmt(entry.mass).text : '—' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+
+              <h3>生成物理论产量</h3>
+              <table class="stoich-table">
+                <thead>
+                  <tr>
+                    <th>物质</th>
+                    <th>系数</th>
+                    <th>理论产量 (mol)</th>
+                    <th>理论产量 (g)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="entry in activePlan.result.entries.filter((e) => e.species.side === 'right')"
+                    :key="entry.species.id"
+                  >
+                    <td>{{ entry.species.label }}</td>
+                    <td>{{ entry.species.coefficient }}</td>
+                    <td>{{ fmt(entry.produced!).text }}</td>
+                    <td>{{ entry.mass ? fmt(entry.mass).text : '—（未填摩尔质量）' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </template>
+          </div>
+        </div>
+        <p v-else class="hint">还没有投料方案。点击「+ 新建方案」，或载入「恰好配比 / 试剂过量」示例。</p>
+
+        <div v-if="comparablePlans.length > 0" class="compare-block">
+          <h3>方案对比（仅列结果有效的方案）</h3>
+          <table class="stoich-table">
+            <thead>
+              <tr>
+                <th>项目</th>
+                <th v-for="p in comparablePlans" :key="p.id">{{ p.name }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>限量试剂</td>
+                <td v-for="p in comparablePlans" :key="p.id">{{ limitingText(p.result!) }}</td>
+              </tr>
+              <tr v-for="label in productLabels" :key="label">
+                <td>{{ label }} 理论产量</td>
+                <td v-for="p in comparablePlans" :key="p.id">{{ productYieldText(p, label) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </template>
     </section>
 
     <section class="syntax-help">
@@ -798,6 +1173,95 @@ button:disabled {
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 14px 18px;
+}
+
+.stoich-section {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin: 16px 0;
+}
+
+.stoich-section h2 {
+  margin-top: 0;
+  font-size: 18px;
+}
+
+.stoich-section h3 {
+  font-size: 15px;
+  margin: 14px 0 6px;
+}
+
+.plan-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.plan-tab {
+  background: #f1f5f9;
+}
+
+.plan-tab.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.plan-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.plan-name-input {
+  font: inherit;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.stoich-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0;
+}
+
+.stoich-table th,
+.stoich-table td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.stoich-table th {
+  background: #f1f5f9;
+}
+
+.stoich-table tr.limiting {
+  background: var(--warn-soft);
+}
+
+.amount-input {
+  width: 110px;
+  font: inherit;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.amount-input.invalid {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.limiting-line {
+  font-size: 16px;
 }
 
 .syntax-help h2 {
