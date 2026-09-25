@@ -2,6 +2,16 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { parseFormula, type ParseResult } from './lib/parser'
 import { balance, type BalanceResult, type Species } from './lib/solver'
+import {
+  computeDosing,
+  emptyDosingInput,
+  formatFraction,
+  isExactDecimal,
+  validateDosing,
+  type DosingResult,
+  type DosingSpecies,
+  type SpeciesDosingInput,
+} from './lib/stoichiometry'
 
 interface Row {
   id: number
@@ -38,13 +48,15 @@ const EXAMPLES: Array<{ name: string; left: string[]; right: string[] }> = [
 ]
 
 interface Snapshot {
-  rows: { side: 'left' | 'right'; text: string }[]
+  rows: { id: number; side: 'left' | 'right'; text: string }[]
   result: BalanceResult
   elementOrder: string[]
 }
 
 const snapshot = ref<Snapshot | null>(null)
 const dirty = ref(false)
+/** 增删物质或修改化学式时 +1，使所有投料方案的旧结果失效 */
+const equationVersion = ref(0)
 const highlightedElement = ref<string | null>(null)
 const copyState = ref<'idle' | 'ok' | 'fail'>('idle')
 const globalMessage = ref('')
@@ -98,6 +110,7 @@ function addRow(side: 'left' | 'right') {
   const rows = side === 'left' ? leftRows : rightRows
   rows.push({ id: nextId++, text: '' })
   dirty.value = true
+  equationVersion.value++
 }
 
 function removeRow(side: 'left' | 'right', id: number) {
@@ -105,6 +118,7 @@ function removeRow(side: 'left' | 'right', id: number) {
   const idx = rows.findIndex((r) => r.id === id)
   if (idx >= 0) rows.splice(idx, 1)
   dirty.value = true
+  equationVersion.value++
 }
 
 function moveRow(side: 'left' | 'right', id: number, delta: -1 | 1) {
@@ -119,6 +133,7 @@ function moveRow(side: 'left' | 'right', id: number, delta: -1 | 1) {
 
 function onInput() {
   dirty.value = true
+  equationVersion.value++
 }
 
 function doBalance() {
@@ -128,12 +143,12 @@ function doBalance() {
   for (const p of leftParsed.value) {
     if (p.row.text.trim() === '' || !p.result.ok) continue
     species.push({ raw: p.row.text.trim(), formula: p.result.formula!, side: 'left' })
-    rowsSnapshot.push({ side: 'left', text: p.row.text })
+    rowsSnapshot.push({ id: p.row.id, side: 'left', text: p.row.text })
   }
   for (const p of rightParsed.value) {
     if (p.row.text.trim() === '' || !p.result.ok) continue
     species.push({ raw: p.row.text.trim(), formula: p.result.formula!, side: 'right' })
-    rowsSnapshot.push({ side: 'right', text: p.row.text })
+    rowsSnapshot.push({ id: p.row.id, side: 'right', text: p.row.text })
   }
   const result = balance(species)
   const elementOrder: string[] = []
@@ -272,6 +287,179 @@ function onRowKeydown(e: KeyboardEvent, side: 'left' | 'right', id: number, inde
 
 function rowsCount(side: 'left' | 'right'): number {
   return (side === 'left' ? leftRows : rightRows).length
+}
+
+/* ---------------- 投料方案 ---------------- */
+
+interface Plan {
+  id: number
+  name: string
+  /** 以物质行 id 为键，调序时投料随物质移动 */
+  inputs: Record<number, SpeciesDosingInput>
+  result: DosingResult | null
+  /** 计算时的 equationVersion；不一致说明方程式已改，结果失效 */
+  resultVersion: number
+}
+
+let nextPlanId = 1
+const PLAN_NAMES = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+function makePlan(name?: string): Plan {
+  const id = nextPlanId++
+  return {
+    id,
+    name: name ?? `方案 ${PLAN_NAMES[(id - 1) % PLAN_NAMES.length]}`,
+    inputs: {},
+    result: null,
+    resultVersion: -1,
+  }
+}
+
+const plans = ref<Plan[]>([makePlan()])
+const activePlanId = ref(plans.value[0].id)
+
+const activePlan = computed(() => plans.value.find((p) => p.id === activePlanId.value) ?? plans.value[0])
+
+function inputFor(plan: Plan, rowId: number): SpeciesDosingInput {
+  if (!plan.inputs[rowId]) plan.inputs[rowId] = emptyDosingInput()
+  return plan.inputs[rowId]
+}
+
+function addPlan() {
+  const p = makePlan()
+  plans.value.push(p)
+  activePlanId.value = p.id
+}
+
+function duplicatePlan(plan: Plan) {
+  const copy = makePlan(`${plan.name} 副本`)
+  const inputs: Record<number, SpeciesDosingInput> = {}
+  for (const [k, v] of Object.entries(plan.inputs)) inputs[Number(k)] = { ...v }
+  copy.inputs = inputs
+  plans.value.push(copy)
+  activePlanId.value = copy.id
+}
+
+function removePlan(plan: Plan) {
+  const idx = plans.value.findIndex((p) => p.id === plan.id)
+  if (idx < 0) return
+  plans.value.splice(idx, 1)
+  if (plans.value.length === 0) plans.value.push(makePlan())
+  if (activePlanId.value === plan.id) activePlanId.value = plans.value[0].id
+}
+
+function onDosingEdit(plan: Plan) {
+  plan.result = null
+}
+
+const dosingApplicable = computed(() => {
+  const snap = snapshot.value
+  return !!snap && !stale.value && snap.result.kind === 'unique'
+})
+
+const hasElectron = computed(() => {
+  const snap = snapshot.value
+  if (!snap) return false
+  return snap.rows.some((r) => {
+    const p = parseFormula(r.text)
+    return p.ok && p.formula.isElectron
+  })
+})
+
+function dosingSpeciesFor(plan: Plan): DosingSpecies[] {
+  const snap = snapshot.value
+  if (!snap || snap.result.kind !== 'unique') return []
+  const coefficients = snap.result.coefficients
+  return snap.rows.map((r, i) => {
+    const inp = inputFor(plan, r.id)
+    return {
+      side: r.side,
+      coefficient: coefficients[i],
+      amountText: inp.amountText,
+      unit: inp.unit,
+      molarMassText: inp.molarMassText,
+    }
+  })
+}
+
+const activePlanErrors = computed(() => {
+  if (!dosingApplicable.value || hasElectron.value) return []
+  return validateDosing(dosingSpeciesFor(activePlan.value))
+})
+
+function errorFor(rowIndex: number, field: 'amount' | 'molarMass'): string | null {
+  const e = activePlanErrors.value.find((e) => e.index === rowIndex && e.field === field)
+  return e ? e.message : null
+}
+
+function computePlan(plan: Plan) {
+  if (!dosingApplicable.value || hasElectron.value) return
+  const out = computeDosing(dosingSpeciesFor(plan))
+  if (out.ok) {
+    plan.result = out.result
+    plan.resultVersion = equationVersion.value
+  } else {
+    plan.result = null
+  }
+}
+
+function planResultValid(plan: Plan): boolean {
+  return plan.result !== null && plan.resultVersion === equationVersion.value && !stale.value
+}
+
+const comparablePlans = computed(() => plans.value.filter((p) => planResultValid(p)))
+
+function fillDosingExample(kind: 'stoich' | 'excess') {
+  const snap = snapshot.value
+  if (!snap || snap.result.kind !== 'unique') return
+  const plan = activePlan.value
+  let firstLeft = true
+  snap.rows.forEach((r, i) => {
+    if (r.side !== 'left') return
+    const coef = snap.result.kind === 'unique' ? snap.result.coefficients[i] : 1n
+    const mult = kind === 'excess' && firstLeft ? 2n : 1n
+    firstLeft = false
+    const inp = inputFor(plan, r.id)
+    inp.amountText = (coef * mult).toString()
+    inp.unit = 'mol'
+  })
+  plan.result = null
+  globalMessage.value =
+    kind === 'stoich'
+      ? `已按配平系数填入「${plan.name}」：各反应物恰好配比。`
+      : `已填入「${plan.name}」：第一种反应物加倍（过量），其余按系数配比。`
+}
+
+function approx(f: Parameters<typeof isExactDecimal>[0]): string {
+  return isExactDecimal(f) ? '' : '≈'
+}
+
+function onDosingKeydown(e: KeyboardEvent) {
+  if (e.key === 'Enter') {
+    e.preventDefault()
+    computePlan(activePlan.value)
+  }
+}
+
+function coefOf(i: number): bigint | null {
+  const snap = snapshot.value
+  if (!snap || snap.result.kind !== 'unique') return null
+  return snap.result.coefficients[i]
+}
+
+function rowText(i: number): string {
+  return snapshot.value?.rows[i]?.text ?? ''
+}
+
+function limitingText(plan: Plan): string {
+  if (!plan.result) return ''
+  return plan.result.limiting.map((i) => rowText(i)).join('、')
+}
+
+function productYieldText(plan: Plan, rowIndex: number): string {
+  const line = plan.result?.products.find((l) => l.index === rowIndex)
+  if (!line) return '—'
+  return `${approx(line.producedMol)}${formatFraction(line.producedMol)}`
 }
 
 function onGlobalKey(e: KeyboardEvent) {
@@ -477,6 +665,239 @@ onUnmounted(() => window.removeEventListener('keydown', onGlobalKey))
       <div v-else-if="snapshot.result.kind === 'infinite'" class="banner bad" role="alert">
         <strong>解不唯一：</strong>{{ snapshot.result.reason }}
       </div>
+    </section>
+
+    <section v-if="dosingApplicable && snapshot" class="dosing" aria-label="限量试剂与投料方案">
+      <h2>限量试剂与投料方案比较</h2>
+      <p class="hint">
+        假设：反应完全进行、无副反应，反应进度 ξ 由限量试剂决定。显示数值四舍五入保留 6
+        位小数（「≈」表示近似），内部始终以精确有理数计算与比较。
+      </p>
+
+      <div v-if="hasElectron" class="banner warn" role="status">
+        当前方程式含电子 e^-（半反应），投料与产量计算不适用，请改用完整反应。
+      </div>
+
+      <template v-else>
+        <div class="plan-tabs" role="tablist" aria-label="投料方案列表">
+          <button
+            v-for="p in plans"
+            :key="p.id"
+            type="button"
+            role="tab"
+            :aria-selected="p.id === activePlanId"
+            class="plan-tab"
+            :class="{ active: p.id === activePlanId }"
+            @click="activePlanId = p.id"
+          >
+            {{ p.name }}<span v-if="planResultValid(p)" class="plan-ok"> ✓</span>
+          </button>
+          <button type="button" class="plan-add" @click="addPlan">+ 新建方案</button>
+        </div>
+
+        <div class="plan-toolbar">
+          <label class="plan-name">
+            方案名
+            <input v-model="activePlan.name" aria-label="方案名称" />
+          </label>
+          <button type="button" @click="duplicatePlan(activePlan)">复制方案</button>
+          <button type="button" @click="removePlan(activePlan)">删除方案</button>
+          <span class="toolbar-sep"></span>
+          <button type="button" class="example-btn" @click="fillDosingExample('excess')">
+            示例：试剂过量
+          </button>
+          <button type="button" class="example-btn" @click="fillDosingExample('stoich')">
+            示例：恰好配比
+          </button>
+        </div>
+
+        <p v-if="activePlan.result && !planResultValid(activePlan)" class="banner warn" role="status">
+          方程式或投料已修改，「{{ activePlan.name }}」的旧结果已失效，请重新计算。
+        </p>
+
+        <table class="dosing-table">
+          <thead>
+            <tr>
+              <th>物质</th>
+              <th>系数</th>
+              <th>投料数量</th>
+              <th>单位</th>
+              <th>摩尔质量 (g/mol)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="(r, i) in snapshot.rows"
+              :key="r.id"
+              :class="{ invalid: errorFor(i, 'amount') || errorFor(i, 'molarMass') }"
+            >
+              <td>
+                <span class="side-tag">{{ r.side === 'left' ? '反应物' : '生成物' }}</span>
+                {{ r.text }}
+              </td>
+              <td class="coef-cell">{{ coefOf(i) }}</td>
+              <template v-if="r.side === 'left'">
+                <td>
+                  <input
+                    v-model="inputFor(activePlan, r.id).amountText"
+                    class="num-input"
+                    :aria-label="`${r.text} 投料数量`"
+                    :aria-invalid="!!errorFor(i, 'amount')"
+                    placeholder="如 2、0.5"
+                    @input="onDosingEdit(activePlan)"
+                    @keydown="onDosingKeydown"
+                  />
+                  <p v-if="errorFor(i, 'amount')" class="error" role="alert">
+                    {{ errorFor(i, 'amount') }}
+                  </p>
+                </td>
+                <td>
+                  <select
+                    v-model="inputFor(activePlan, r.id).unit"
+                    :aria-label="`${r.text} 投料单位`"
+                    @change="onDosingEdit(activePlan)"
+                  >
+                    <option value="mol">mol</option>
+                    <option value="mmol">mmol</option>
+                    <option value="g">g</option>
+                  </select>
+                </td>
+              </template>
+              <td v-else colspan="2" class="hint">生成物无需投料</td>
+              <td>
+                <input
+                  v-model="inputFor(activePlan, r.id).molarMassText"
+                  class="num-input"
+                  :aria-label="`${r.text} 摩尔质量`"
+                  :aria-invalid="!!errorFor(i, 'molarMass')"
+                  placeholder="选填"
+                  @input="onDosingEdit(activePlan)"
+                  @keydown="onDosingKeydown"
+                />
+                <p v-if="errorFor(i, 'molarMass')" class="error" role="alert">
+                  {{ errorFor(i, 'molarMass') }}
+                </p>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="actions">
+          <button
+            type="button"
+            class="balance-btn"
+            :disabled="activePlanErrors.length > 0"
+            @click="computePlan(activePlan)"
+          >
+            计算「{{ activePlan.name }}」投料结果
+          </button>
+          <span v-if="activePlanErrors.length > 0" class="hint">
+            请先修正上方标红的 {{ activePlanErrors.length }} 处输入。
+          </span>
+        </div>
+
+        <div v-if="planResultValid(activePlan) && activePlan.result" class="dosing-result">
+          <h3>「{{ activePlan.name }}」计算结果</h3>
+          <p>
+            反应进度 ξ = {{ approx(activePlan.result.extent)
+            }}{{ formatFraction(activePlan.result.extent) }} mol ；
+            限量试剂：
+            <strong>{{ limitingText(activePlan) }}</strong>
+            <span v-if="activePlan.result.limiting.length > 1">（并列限量，恰好配比）</span>
+          </p>
+
+          <h4>反应物：换算、比例与剩余</h4>
+          <table class="check-table">
+            <thead>
+              <tr>
+                <th>物质</th>
+                <th>投料</th>
+                <th>换算 n (mol)</th>
+                <th>n ÷ 系数</th>
+                <th>消耗 (mol)</th>
+                <th>剩余 (mol)</th>
+                <th>剩余 (g)</th>
+                <th>角色</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="line in activePlan.result.reactants" :key="line.index">
+                <td>{{ rowText(line.index) }}</td>
+                <td>
+                  {{ inputFor(activePlan, snapshot.rows[line.index].id).amountText }}
+                  {{ inputFor(activePlan, snapshot.rows[line.index].id).unit }}
+                </td>
+                <td>{{ approx(line.initialMol) }}{{ formatFraction(line.initialMol) }}</td>
+                <td>{{ approx(line.ratio) }}{{ formatFraction(line.ratio) }}</td>
+                <td>{{ approx(line.consumedMol) }}{{ formatFraction(line.consumedMol) }}</td>
+                <td>{{ approx(line.remainingMol) }}{{ formatFraction(line.remainingMol) }}</td>
+                <td>
+                  <span v-if="line.remainingG">
+                    {{ approx(line.remainingG) }}{{ formatFraction(line.remainingG) }}
+                  </span>
+                  <span v-else class="hint">—</span>
+                </td>
+                <td :class="line.limiting ? 'limiting' : 'ok'">
+                  {{ line.limiting ? '限量试剂' : '过量' }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h4>生成物：理论产量</h4>
+          <table class="check-table">
+            <thead>
+              <tr>
+                <th>物质</th>
+                <th>理论产量 (mol)</th>
+                <th>理论产量 (g)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="line in activePlan.result.products" :key="line.index">
+                <td>{{ rowText(line.index) }}</td>
+                <td>{{ approx(line.producedMol) }}{{ formatFraction(line.producedMol) }}</td>
+                <td>
+                  <span v-if="line.producedG">
+                    {{ approx(line.producedG) }}{{ formatFraction(line.producedG) }}
+                  </span>
+                  <span v-else class="hint">未填摩尔质量</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div v-if="comparablePlans.length > 0" class="compare">
+          <h3>方案对比（{{ comparablePlans.length }} 个有效方案）</h3>
+          <table class="check-table compare-table">
+            <thead>
+              <tr>
+                <th>项目</th>
+                <th v-for="p in comparablePlans" :key="p.id">{{ p.name }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>限量试剂</td>
+                <td v-for="p in comparablePlans" :key="p.id">{{ limitingText(p) }}</td>
+              </tr>
+              <tr>
+                <td>反应进度 ξ (mol)</td>
+                <td v-for="p in comparablePlans" :key="p.id">
+                  {{ approx(p.result!.extent) }}{{ formatFraction(p.result!.extent) }}
+                </td>
+              </tr>
+              <template v-for="(r, i) in snapshot.rows" :key="r.id">
+                <tr v-if="r.side === 'right'">
+                  <td>{{ r.text }} 产量 (mol)</td>
+                  <td v-for="p in comparablePlans" :key="p.id">{{ productYieldText(p, i) }}</td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </template>
     </section>
 
     <section class="syntax-help">
@@ -798,6 +1219,145 @@ button:disabled {
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 14px 18px;
+}
+
+.dosing {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin: 16px 0;
+}
+
+.dosing h2 {
+  margin-top: 0;
+}
+
+.plan-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0 10px;
+}
+
+.plan-tab {
+  border-radius: 6px 6px 0 0;
+  border-bottom: none;
+  padding: 6px 14px;
+  background: #f1f5f9;
+}
+
+.plan-tab.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.plan-tab.active:hover:not(:disabled) {
+  color: #fff;
+}
+
+.plan-ok {
+  color: #4ade80;
+}
+
+.plan-add {
+  border-style: dashed;
+  color: var(--accent);
+}
+
+.plan-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.plan-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+}
+
+.plan-name input {
+  font: inherit;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  width: 140px;
+}
+
+.toolbar-sep {
+  width: 1px;
+  height: 22px;
+  background: var(--border);
+}
+
+.dosing-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.dosing-table th,
+.dosing-table td {
+  border: 1px solid var(--border);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.dosing-table th {
+  background: #f1f5f9;
+}
+
+.dosing-table tr.invalid {
+  background: var(--danger-soft);
+}
+
+.coef-cell {
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.num-input {
+  width: 110px;
+  font: inherit;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.num-input[aria-invalid='true'] {
+  border-color: var(--danger);
+}
+
+.dosing-table select {
+  font: inherit;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.dosing-result h3,
+.compare h3 {
+  margin-bottom: 6px;
+}
+
+.dosing-result h4 {
+  margin: 14px 0 6px;
+}
+
+.check-table td.limiting {
+  color: var(--warn);
+  font-weight: 700;
+}
+
+.compare {
+  margin-top: 18px;
+  border-top: 1px dashed var(--border);
+  padding-top: 10px;
 }
 
 .syntax-help h2 {
